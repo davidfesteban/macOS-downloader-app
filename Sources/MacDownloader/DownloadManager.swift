@@ -4,16 +4,20 @@ import Foundation
 @MainActor
 final class DownloadManager: NSObject, ObservableObject {
     @Published private(set) var items: [DownloadItem] = []
-    @Published var destinationDirectory: URL
+    @Published private(set) var destinationDirectory: URL
 
     private let store = DownloadStore()
+    private let defaultDestinationKey = "defaultDestinationPath"
     private lazy var session = makeSession()
     private var tasksByID: [UUID: URLSessionDownloadTask] = [:]
     private var itemIDsByTaskID: [Int: UUID] = [:]
     private var lastProgressByID: [UUID: (date: Date, bytesWritten: Int64)] = [:]
 
     override init() {
-        destinationDirectory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+        let downloadsDirectory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+        let savedDestinationPath = UserDefaults.standard.string(forKey: defaultDestinationKey)
+        let savedDestination = savedDestinationPath.map(URL.init(fileURLWithPath:))
+        destinationDirectory = savedDestination.flatMap { Self.existingDirectory(at: $0) } ?? downloadsDirectory
         super.init()
         items = store.load().map { item in
             var mutableItem = item
@@ -26,8 +30,16 @@ final class DownloadManager: NSObject, ObservableObject {
         persist()
     }
 
-    func add(urls: [URL]) {
-        let newItems = urls.map { DownloadItem.make(url: $0, destinationDirectory: destinationDirectory) }
+    func setDefaultDestination(_ directory: URL) {
+        guard let directory = Self.existingDirectory(at: directory) else { return }
+
+        destinationDirectory = directory
+        UserDefaults.standard.set(directory.path, forKey: defaultDestinationKey)
+    }
+
+    func add(urls: [URL], destinationDirectory: URL? = nil) {
+        let directory = destinationDirectory ?? self.destinationDirectory
+        let newItems = urls.map { DownloadItem.make(url: $0, destinationDirectory: directory) }
         items.insert(contentsOf: newItems, at: 0)
         persist()
 
@@ -283,5 +295,14 @@ extension DownloadManager: URLSessionDownloadDelegate {
         }
 
         return (currentSpeed * 0.7) + (instantSpeed * 0.3)
+    }
+
+    private static func existingDirectory(at url: URL) -> URL? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return nil
+        }
+
+        return url.standardizedFileURL
     }
 }

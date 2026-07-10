@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct ContentView: View {
@@ -58,14 +59,36 @@ struct ContentView: View {
 
             Spacer()
 
-            Text(downloadManager.destinationDirectory.path)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            Button {
+                chooseDefaultDestination()
+            } label: {
+                Label {
+                    Text(downloadManager.destinationDirectory.path)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } icon: {
+                    Image(systemName: "externaldrive")
+                }
+            }
+            .help("Choose the default download destination")
         }
         .padding(12)
         .background(.bar)
+    }
+
+    private func chooseDefaultDestination() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Default Download Folder"
+        panel.message = "New downloads will be saved here unless you choose a different folder for them."
+        panel.prompt = "Use Folder"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = downloadManager.destinationDirectory
+
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        downloadManager.setDefaultDestination(directory)
     }
 }
 
@@ -100,12 +123,17 @@ struct DownloadRow: View {
                     Text(item.sizeText)
                     Text(item.speedText)
                     Text(item.estimatedTimeText)
-                    Text(item.url.absoluteString)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+                if let destinationPath = item.destinationPath {
+                    Label(destinationPath, systemImage: "folder")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
 
                 if let errorMessage = item.errorMessage {
                     Text(errorMessage)
