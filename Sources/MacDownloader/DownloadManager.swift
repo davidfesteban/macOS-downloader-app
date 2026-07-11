@@ -1,6 +1,31 @@
 import AppKit
 import Foundation
 
+private struct DownloadTaskContext: Codable {
+    let itemID: UUID
+    let destinationPath: String
+
+    var encoded: String? {
+        guard let data = try? JSONEncoder().encode(self) else { return nil }
+        return data.base64EncodedString()
+    }
+
+    init?(encoded: String?) {
+        guard let encoded,
+              let data = Data(base64Encoded: encoded),
+              let context = try? JSONDecoder().decode(Self.self, from: data) else {
+            return nil
+        }
+
+        self = context
+    }
+
+    init(itemID: UUID, destinationPath: String) {
+        self.itemID = itemID
+        self.destinationPath = destinationPath
+    }
+}
+
 @MainActor
 final class DownloadManager: NSObject, ObservableObject {
     @Published private(set) var items: [DownloadItem] = []
@@ -58,6 +83,10 @@ final class DownloadManager: NSObject, ObservableObject {
         } else {
             task = session.downloadTask(with: items[index].url)
         }
+        task.taskDescription = DownloadTaskContext(
+            itemID: items[index].id,
+            destinationPath: items[index].destinationPath ?? destinationDirectory.appendingPathComponent(items[index].fileName).path
+        ).encoded
 
         items[index].state = .downloading
         items[index].errorMessage = nil
@@ -183,39 +212,105 @@ extension DownloadManager: URLSessionDownloadDelegate {
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
-        Task { @MainActor in
-            guard let itemID = itemIDsByTaskID[downloadTask.taskIdentifier],
-                  let index = items.firstIndex(where: { $0.id == itemID }) else { return }
-
-            let destinationURL = uniqueDestinationURL(for: items[index])
-
-            do {
-                try FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                if FileManager.default.fileExists(atPath: destinationURL.path) {
-                    try FileManager.default.removeItem(at: destinationURL)
-                }
-                try FileManager.default.moveItem(at: location, to: destinationURL)
-
-                store.deleteResumeData(for: items[index])
-                items[index].destinationPath = destinationURL.path
-                items[index].state = .completed
-                items[index].bytesWritten = downloadTask.countOfBytesReceived
-                items[index].totalBytes = max(downloadTask.countOfBytesExpectedToReceive, downloadTask.countOfBytesReceived)
-                items[index].resumeDataFileName = nil
-                items[index].speedBytesPerSecond = nil
-                items[index].updatedAt = Date()
-            } catch {
-                items[index].state = .failed
-                items[index].errorMessage = error.localizedDescription
-                items[index].speedBytesPerSecond = nil
-                items[index].updatedAt = Date()
+        guard let context = DownloadTaskContext(encoded: downloadTask.taskDescription) else {
+            Task { @MainActor in
+                self.finishDownload(
+                    itemID: self.itemIDsByTaskID[downloadTask.taskIdentifier],
+                    taskID: downloadTask.taskIdentifier,
+                    result: .failure(DownloadError.missingDestination)
+                )
             }
-
-            tasksByID[itemID] = nil
-            lastProgressByID[itemID] = nil
-            itemIDsByTaskID[downloadTask.taskIdentifier] = nil
-            persist()
+            return
         }
+
+        // URLSession owns this temporary file and can remove it as soon as this
+        // callback returns. Copy it before hopping to the main actor. Copying
+        // also works when the selected destination is on another volume, such
+        // as an external drive.
+        let destinationURL = Self.uniqueDestinationURL(for: URL(fileURLWithPath: context.destinationPath))
+
+        do {
+            try FileManager.default.createDirectory(
+                at: destinationURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.copyItem(at: location, to: destinationURL)
+
+            Task { @MainActor in
+                self.finishDownload(
+                    itemID: context.itemID,
+                    taskID: downloadTask.taskIdentifier,
+                    result: .success(destinationURL),
+                    bytesReceived: downloadTask.countOfBytesReceived,
+                    expectedBytes: downloadTask.countOfBytesExpectedToReceive
+                )
+            }
+        } catch {
+            Task { @MainActor in
+                self.finishDownload(
+                    itemID: context.itemID,
+                    taskID: downloadTask.taskIdentifier,
+                    result: .failure(error)
+                )
+            }
+        }
+    }
+
+    private func finishDownload(
+        itemID: UUID?,
+        taskID: Int,
+        result: Result<URL, Error>,
+        bytesReceived: Int64 = 0,
+        expectedBytes: Int64 = 0
+    ) {
+        guard let itemID, let index = items.firstIndex(where: { $0.id == itemID }) else { return }
+
+        switch result {
+        case .success(let destinationURL):
+            store.deleteResumeData(for: items[index])
+            items[index].destinationPath = destinationURL.path
+            items[index].state = .completed
+            items[index].bytesWritten = bytesReceived
+            items[index].totalBytes = max(expectedBytes, bytesReceived)
+            items[index].resumeDataFileName = nil
+            items[index].speedBytesPerSecond = nil
+            items[index].errorMessage = nil
+        case .failure(let error):
+            items[index].state = .failed
+            items[index].errorMessage = error.localizedDescription
+            items[index].speedBytesPerSecond = nil
+        }
+
+        items[index].updatedAt = Date()
+        tasksByID[itemID] = nil
+        lastProgressByID[itemID] = nil
+        itemIDsByTaskID[taskID] = nil
+        persist()
+    }
+
+    private enum DownloadError: LocalizedError {
+        case missingDestination
+
+        var errorDescription: String? {
+            "The download destination could not be determined. Please start the download again."
+        }
+    }
+
+    nonisolated private static func uniqueDestinationURL(for baseURL: URL) -> URL {
+        let directory = baseURL.deletingLastPathComponent()
+        let name = baseURL.deletingPathExtension().lastPathComponent
+        let pathExtension = baseURL.pathExtension
+
+        var candidate = baseURL
+        var counter = 2
+
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            let fileName = pathExtension.isEmpty ? "\(name) \(counter)" : "\(name) \(counter).\(pathExtension)"
+            candidate = directory.appendingPathComponent(fileName)
+            counter += 1
+        }
+
+        return candidate
     }
 
     nonisolated func urlSession(
@@ -250,24 +345,6 @@ extension DownloadManager: URLSessionDownloadDelegate {
             itemIDsByTaskID[task.taskIdentifier] = nil
             persist()
         }
-    }
-
-    private func uniqueDestinationURL(for item: DownloadItem) -> URL {
-        let baseURL = item.destinationPath.map(URL.init(fileURLWithPath:)) ?? destinationDirectory.appendingPathComponent(item.fileName)
-        let directory = baseURL.deletingLastPathComponent()
-        let name = baseURL.deletingPathExtension().lastPathComponent
-        let pathExtension = baseURL.pathExtension
-
-        var candidate = baseURL
-        var counter = 2
-
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            let fileName = pathExtension.isEmpty ? "\(name) \(counter)" : "\(name) \(counter).\(pathExtension)"
-            candidate = directory.appendingPathComponent(fileName)
-            counter += 1
-        }
-
-        return candidate
     }
 
     private func calculateSpeed(
